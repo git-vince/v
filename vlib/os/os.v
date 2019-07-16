@@ -6,7 +6,7 @@ module os
 
 #include <sys/stat.h>
 #include <signal.h>
-//#include <unistd.h>
+#include <unistd.h>
 #include <errno.h>
 //#include <execinfo.h> // for backtrace_symbols_fd 
 
@@ -29,11 +29,9 @@ const (
 	MAX_PATH = 4096
 )
 
-const (
-	FILE_ATTRIBUTE_DIRECTORY = 16 // Windows 
-)
-
+// Windows 
 import const (
+	FILE_ATTRIBUTE_DIRECTORY
 	INVALID_FILE_ATTRIBUTES
 ) 
 
@@ -106,7 +104,6 @@ fn parse_windows_cmd_line(cmd byteptr) []string {
 }
 
 // read_file reads the file in `path` and returns the contents.
-//pub fn read_file(path string) ?string {
 pub fn read_file(path string) ?string { 
 	mut res := ''
 	mut mode := 'rb' 
@@ -239,6 +236,10 @@ pub fn (f File) writeln(s string) {
 	C.fputs('\n', f.cfile)
 }
 
+pub fn (f File) flush() {
+	C.fflush(f.cfile)
+}
+
 pub fn (f File) close() {
 	C.fclose(f.cfile)
 }
@@ -289,21 +290,29 @@ pub fn getenv(key string) string {
 }
 
 pub fn setenv(name string, value string, overwrite bool) int {
-$if windows {
- 
-} 
-$else { 
-  return C.setenv(name.cstr(), value.cstr(), overwrite)
-} 
+	$if windows {
+		format := '$name=$value'
+
+		if overwrite {
+			return C._putenv(format.cstr())
+		}
+
+		return -1
+	} 
+	$else { 
+		return C.setenv(name.cstr(), value.cstr(), overwrite)
+	} 
 }
 
 pub fn unsetenv(name string) int {
-$if windows {
- 
-} 
-$else { 
-  return C.unsetenv(name.cstr())
-} 
+	$if windows {
+		format := '${name}='
+		
+		return C._putenv(format.cstr())
+	} 
+	$else { 
+		return C.unsetenv(name.cstr())
+	} 
 }
 
 // `file_exists` returns true if `path` exists.
@@ -317,7 +326,13 @@ pub fn file_exists(path string) bool {
 pub fn dir_exists(path string) bool {
 	$if windows {
 		attr := int(C.GetFileAttributes(path.cstr())) 
-		return attr == FILE_ATTRIBUTE_DIRECTORY 
+		if attr == INVALID_FILE_ATTRIBUTES {
+			return false
+		}
+		if (attr & FILE_ATTRIBUTE_DIRECTORY) != 0 {
+			return true
+		}
+		return false
 	} 
 	$else { 
 		dir := C.opendir(path.cstr())
@@ -342,28 +357,21 @@ pub fn mkdir(path string) {
 
 // rm removes file in `path`.
 pub fn rm(path string) {
-	$if windows {
-		// os.system2('del /f $path')
-	}
-	$else {
-		C.remove(path.cstr())
-	}
+	C.remove(path.cstr())
 	// C.unlink(path.cstr())
 }
 
-/*
-// TODO
-fn rmdir(path, guard string) {
-	if !path.contains(guard) {
-		println('rmdir canceled because the path doesnt contain $guard')
-		return
-	}
+
+// rmdir removes a specified directory.
+pub fn rmdir(path string) {
 	$if !windows {
+		C.rmdir(path.cstr())		
 	}
 	$else {
+		C.RemoveDirectoryA(path.cstr())
 	}
 }
-*/
+
 
 fn print_c_errno() {
 	//C.printf('errno=%d err="%s"\n', errno, C.strerror(errno)) 
@@ -377,6 +385,24 @@ pub fn ext(path string) string {
 	}
 	return path.right(pos)
 }
+
+
+// dir returns all but the last element of path, typically the path's directory.  
+pub fn dir(path string) string {
+	mut pos := -1
+	// TODO PathSeparator defined in os_win.v doesn't work when building V, 
+	// because v.c is generated for a nix system. 
+	$if windows { 
+		pos = path.last_index('\\') 
+	} 
+	$else { 
+		pos = path.last_index(PathSeparator) 
+	} 
+	if pos == -1 {
+		return '.' 
+	} 
+	return path.left(pos) 
+} 
 
 fn path_sans_ext(path string) string {
 	pos := path.last_index('.')
@@ -451,6 +477,9 @@ pub fn user_os() string {
 	$if windows {
 		return 'windows'
 	}
+	$if freebsd {
+		return 'freebsd' 
+	} 
 	return 'unknown'
 }
 
@@ -459,7 +488,14 @@ pub fn home_dir() string {
 	mut home := os.getenv('HOME')
 	$if windows {
 		home = os.getenv('HOMEDRIVE')
-		home += os.getenv('HOMEPATH')
+		if home.len == 0 {
+			home = os.getenv('SYSTEMDRIVE')
+		}
+		mut homepath := os.getenv('HOMEPATH')
+		if homepath.len == 0 {
+			homepath = '\\Users\\' + os.getenv('USERNAME')
+		}
+		home += homepath
 	}
 	home += '/'
 	return home
@@ -493,25 +529,54 @@ fn on_segfault(f voidptr) {
 	}
 }
 
-pub fn getexepath() string {
-	mut result := [4096]byte // [MAX_PATH]byte --> error byte undefined
+pub fn executable() string {
+	mut result := malloc(MAX_PATH) 
 	$if linux {
 		count := int(C.readlink('/proc/self/exe', result, MAX_PATH ))
-		if(count < 0) {
+		if count < 0 {
 			panic('error reading /proc/self/exe to get exe path')
 		}
 		return tos(result, count)
 	}
-
 	$if windows {
 		ret := int(C.GetModuleFileName( 0, result, MAX_PATH ))
 		return tos( result, ret)
 	}
-
 	$if mac {
-		//panic('getexepath() not impl')
-		return ''
+		pid := C.getpid() 
+		ret := C.proc_pidpath (pid, result, MAX_PATH) 
+		if ret <= 0  {
+			println('os.executable() failed') 
+			return '.'  
+		}  
+		return string(result) 
 	}
+	$if freebsd {
+		mut mib := [1 /* CTL_KERN */, 14 /* KERN_PROC */, 12 /* KERN_PROC_PATHNAME */, -1]!! 
+		size := MAX_PATH 
+		C.sysctl(mib, 4, result, &size, 0, 0) 
+		return string(result) 
+	} 
+	$if openbsd {
+		// "Sadly there is no way to get the full path of the executed file in OpenBSD." 
+		// lol 
+		return os.args[0] 
+	} 
+	$if netbsd {
+		count := int(C.readlink('/proc/curproc/exe', result, MAX_PATH ))
+		if count < 0 {
+			panic('error reading /proc/curproc/exe to get exe path')
+		}
+		return tos(result, count)
+	} 
+	$if dragonfly {
+		count := int(C.readlink('/proc/curproc/file', result, MAX_PATH ))
+		if count < 0 {
+			panic('error reading /proc/curproc/file to get exe path')
+		}
+		return tos(result, count)
+	} 
+	return '.' 
 }
 
 pub fn is_dir(path string) bool {
@@ -615,7 +680,7 @@ pub fn ls(path string) []string {
 	} 
 	$else { 
 		mut res := []string
-		dir := C.opendir(path.str)
+		dir := C.opendir(path.cstr()) 
 		if isnil(dir) {
 			println('ls() couldnt open dir "$path"')
 			print_c_errno()
@@ -639,6 +704,20 @@ pub fn ls(path string) []string {
 
 pub fn signal(signum int, handler voidptr) {
 	C.signal(signum, handler)
+}
+
+pub fn fork() int {
+	$if !windows {
+		pid := C.fork()
+		return pid
+	}
+}
+
+pub fn wait() int {
+	$if !windows {
+		pid := C.wait(0)
+		return pid
+	}
 }
 
 pub fn file_last_mod_unix(path string) int {

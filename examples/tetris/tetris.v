@@ -89,8 +89,7 @@ struct Game {
 	// -1  0  0 -1
 	// -1  0  0 -1
 	// -1 -1 -1 -1
-	// TODO: field [][]int
-	field       array_array_int
+	field       [][]int 
 	// TODO: tetro Tetro
 	tetro       []Block
 	// TODO: tetros_cache []Tetro
@@ -140,7 +139,7 @@ fn main() {
 }
 
 fn (g mut Game) init_game() {
-	rand.seed()
+	rand.seed(time.now().uni)
 	g.generate_tetro()
 	g.field = []array_int // TODO: g.field = [][]int
 	// Generate the field, fill it with 0's, add -1's on each edge
